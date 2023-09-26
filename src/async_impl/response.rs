@@ -2,9 +2,10 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes};
 use encoding_rs::{Encoding, UTF_8};
 use futures_util::stream::StreamExt;
+use hyper::body::HttpBody;
 use hyper::client::connect::HttpInfo;
 use hyper::{HeaderMap, StatusCode, Version};
 use mime::Mime;
@@ -20,6 +21,47 @@ use super::decoder::{Accepts, Decoder};
 #[cfg(feature = "cookies")]
 use crate::cookie;
 use crate::response::ResponseUrl;
+
+async fn to_bytes<T>(body: T) -> Result<(Bytes, u64), T::Error>
+where
+    T: HttpBody,
+{
+    fn get_size<T: HttpBody>(body: Pin<&mut T>) -> u64 {
+        HttpBody::size_hint(&*body).exact().unwrap_or_default()
+    }
+
+    futures_util::pin_mut!(body);
+
+    // If there's only 1 chunk, we can just return Buf::to_bytes()
+    let mut first = if let Some(buf) = body.data().await {
+        buf?
+    } else {
+        return Ok((Bytes::new(), get_size(body)));
+    };
+
+    let second = if let Some(buf) = body.data().await {
+        buf?
+    } else {
+        return Ok((first.copy_to_bytes(first.remaining()), get_size(body)));
+    };
+
+    // Don't pre-emptively reserve *too* much.
+    let rest = (body.size_hint().lower() as usize).min(1024 * 16);
+    let cap = first
+        .remaining()
+        .saturating_add(second.remaining())
+        .saturating_add(rest);
+    // With more than 1 buf, we gotta flatten into a Vec first.
+    let mut vec = Vec::with_capacity(cap);
+    vec.put(first);
+    vec.put(second);
+
+    while let Some(buf) = body.data().await {
+        vec.put(buf?);
+    }
+
+    Ok((vec.into(), get_size(body)))
+}
 
 /// A Response to a submitted `Request`.
 pub struct Response {
@@ -78,7 +120,7 @@ impl Response {
     /// - The response is compressed and automatically decoded (thus changing
     ///   the actual decoded length).
     pub fn content_length(&self) -> Option<u64> {
-        use hyper::body::HttpBody;
+        // use hyper::body::HttpBody;
 
         HttpBody::size_hint(self.res.body()).exact()
     }
@@ -257,6 +299,14 @@ impl Response {
     /// ```
     pub async fn bytes(self) -> crate::Result<Bytes> {
         hyper::body::to_bytes(self.res.into_body()).await
+    }
+
+    /// Get the full response body as `Bytes` and original size of it.
+    pub async fn bytes_and_size(self) -> crate::Result<(Bytes, u64)> {
+        // let (bytes, body) = to_bytes(self.body).await?;
+        // let size = HttpBody::size_hint(&body).exact().unwrap_or_default();
+        // Ok((bytes, size as usize))
+        to_bytes(self.res.into_body()).await
     }
 
     /// Stream a chunk of the response body.
