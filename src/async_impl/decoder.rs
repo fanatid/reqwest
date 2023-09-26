@@ -41,6 +41,7 @@ pub(super) struct Accepts {
 /// The inner decoder may be constructed asynchronously.
 pub(crate) struct Decoder {
     inner: Inner,
+    size: usize,
 }
 
 type PeekableIoStream = Peekable<IoStream>;
@@ -94,6 +95,7 @@ impl Decoder {
     pub(crate) fn empty() -> Decoder {
         Decoder {
             inner: Inner::PlainText(Body::empty().into_stream()),
+            size: 0,
         }
     }
 
@@ -103,6 +105,7 @@ impl Decoder {
     fn plain_text(body: Body) -> Decoder {
         Decoder {
             inner: Inner::PlainText(body.into_stream()),
+            size: 0,
         }
     }
 
@@ -118,6 +121,7 @@ impl Decoder {
                 IoStream(body.into_stream()).peekable(),
                 DecoderType::Gzip,
             ))),
+            size: 0,
         }
     }
 
@@ -133,6 +137,7 @@ impl Decoder {
                 IoStream(body.into_stream()).peekable(),
                 DecoderType::Brotli,
             ))),
+            size: 0,
         }
     }
 
@@ -148,6 +153,7 @@ impl Decoder {
                 IoStream(body.into_stream()).peekable(),
                 DecoderType::Deflate,
             ))),
+            size: 0,
         }
     }
 
@@ -228,11 +234,20 @@ impl Stream for Decoder {
                 Poll::Ready(Err(e)) => Poll::Ready(Some(Err(crate::error::decode_io(e)))),
                 Poll::Pending => Poll::Pending,
             },
-            Inner::PlainText(ref mut body) => Pin::new(body).poll_next(cx),
+            Inner::PlainText(ref mut body) => match Pin::new(body).poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    self.size += bytes.len();
+                    Poll::Ready(Some(Ok(bytes)))
+                }
+                value => value,
+            },
             #[cfg(feature = "gzip")]
             Inner::Gzip(ref mut decoder) => {
                 match futures_core::ready!(Pin::new(decoder).poll_next(cx)) {
-                    Some(Ok(bytes)) => Poll::Ready(Some(Ok(bytes.freeze()))),
+                    Some(Ok(bytes)) => {
+                        self.size += bytes.len();
+                        Poll::Ready(Some(Ok(bytes.freeze())))
+                    },
                     Some(Err(err)) => Poll::Ready(Some(Err(crate::error::decode_io(err)))),
                     None => Poll::Ready(None),
                 }
@@ -240,7 +255,10 @@ impl Stream for Decoder {
             #[cfg(feature = "brotli")]
             Inner::Brotli(ref mut decoder) => {
                 match futures_core::ready!(Pin::new(decoder).poll_next(cx)) {
-                    Some(Ok(bytes)) => Poll::Ready(Some(Ok(bytes.freeze()))),
+                    Some(Ok(bytes)) => {
+                        self.size += bytes.len();
+                        Poll::Ready(Some(Ok(bytes.freeze())))
+                    },
                     Some(Err(err)) => Poll::Ready(Some(Err(crate::error::decode_io(err)))),
                     None => Poll::Ready(None),
                 }
@@ -248,7 +266,10 @@ impl Stream for Decoder {
             #[cfg(feature = "deflate")]
             Inner::Deflate(ref mut decoder) => {
                 match futures_core::ready!(Pin::new(decoder).poll_next(cx)) {
-                    Some(Ok(bytes)) => Poll::Ready(Some(Ok(bytes.freeze()))),
+                    Some(Ok(bytes)) => {
+                        self.size += bytes.len();
+                        Poll::Ready(Some(Ok(bytes.freeze())))
+                    },
                     Some(Err(err)) => Poll::Ready(Some(Err(crate::error::decode_io(err)))),
                     None => Poll::Ready(None),
                 }
@@ -276,12 +297,15 @@ impl HttpBody for Decoder {
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        match self.inner {
-            Inner::PlainText(ref body) => HttpBody::size_hint(body),
-            // the rest are "unknown", so default
-            #[cfg(any(feature = "brotli", feature = "gzip", feature = "deflate"))]
-            _ => http_body::SizeHint::default(),
-        }
+        // match self.inner {
+        //     Inner::PlainText(ref body) => HttpBody::size_hint(body),
+        //     // the rest are "unknown", so default
+        //     #[cfg(any(feature = "brotli", feature = "gzip", feature = "deflate"))]
+        //     _ => http_body::SizeHint::default(),
+        // }
+        let mut size = http_body::SizeHint::default();
+        size.set_exact(self.size as u64);
+        size
     }
 }
 
