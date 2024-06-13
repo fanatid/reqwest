@@ -275,3 +275,6 @@ required-features = ["deflate", "stream"]
 name = "multipart"
 path = "tests/multipart.rs"
 required-features = ["multipart"]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

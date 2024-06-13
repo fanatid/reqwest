@@ -1,6 +1,10 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,6 +35,7 @@ pub struct Response {
     // Boxed to save space (11 words to 1 word), and it's not accessed
     // frequently internally.
     url: Box<Url>,
+    size: Arc<AtomicUsize>,
 }
 
 impl Response {
@@ -42,16 +47,19 @@ impl Response {
         read_timeout: Option<Duration>,
     ) -> Response {
         let (mut parts, body) = res.into_parts();
+        let size = Arc::new(AtomicUsize::new(0));
         let decoder = Decoder::detect(
             &mut parts.headers,
             super::body::response(body, total_timeout, read_timeout),
             accepts,
+            Arc::clone(&size),
         );
         let res = hyper::Response::from_parts(parts, decoder);
 
         Response {
             res,
             url: Box::new(url),
+            size,
         }
     }
 
@@ -293,6 +301,14 @@ impl Response {
             .map(|buf| buf.to_bytes())
     }
 
+    ///
+    pub async fn bytes_and_size(self) -> crate::Result<(Bytes, usize)> {
+        use http_body_util::BodyExt;
+
+        let bytes = BodyExt::collect(self.res.into_body()).await?.to_bytes();
+        Ok((bytes, self.size.load(Ordering::Relaxed)))
+    }
+
     /// Stream a chunk of the response body.
     ///
     /// When the response body has been exhausted, this will return `None`.
@@ -454,10 +470,12 @@ impl<T: Into<Body>> From<http::Response<T>> for Response {
 
         let (mut parts, body) = r.into_parts();
         let body: crate::async_impl::body::Body = body.into();
+        let size = Arc::new(AtomicUsize::new(0));
         let decoder = Decoder::detect(
             &mut parts.headers,
             ResponseBody::new(body.map_err(Into::into)),
             Accepts::none(),
+            Arc::clone(&size),
         );
         let url = parts
             .extensions
@@ -468,6 +486,7 @@ impl<T: Into<Body>> From<http::Response<T>> for Response {
         Response {
             res,
             url: Box::new(url),
+            size,
         }
     }
 }
